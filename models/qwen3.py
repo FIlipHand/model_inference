@@ -1,20 +1,53 @@
+import json
 import re
+from dataclasses import dataclass, fields
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
-HEAD_DIM = 128
-HIDDEN_SIZE = 1024
-NUM_HIDDEN_LAYERS = 28
-NUM_ATTENTION_HEADS = 16
-INTERMIDIET_SIZE = 3072
-NUM_KEY_VALUE_HEADS = 8
-VOCAB_SIZE = 151936
-RMS_NORM_EPS = 1e-06
-MAX_SEQ_LEN = 32768
-PAD_TOKEN_ID = 151643
+
+@dataclass
+class Qwen3Config:
+    attention_bias: bool
+    attention_dropout: float
+    bos_token_id: int
+    eos_token_id: int
+    pad_token_id: int
+    head_dim: int
+    hidden_act: str
+    hidden_size: int
+    initializer_range: float
+    intermediate_size: int
+    max_position_embeddings: int
+    max_window_layers: int
+    model_type: str
+    num_attention_heads: int
+    num_hidden_layers: int
+    num_key_value_heads: int
+    rms_norm_eps: float
+    rope_scaling: float
+    rope_theta: int
+    sliding_window: bool
+    tie_word_embeddings: bool
+    torch_dtype: str
+    transformers_version: str
+    use_cache: bool
+    use_sliding_window: bool
+    vocab_size: int
+    max_seq_len: int
+
+    @classmethod
+    def load(cls, path: str) -> "Qwen3Config":
+        with open(f"{path}/config.json", "r") as f:
+            data = json.load(f)
+
+        allowed = {f.name for f in fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in allowed}
+
+        new_cls = cls(**filtered_data, pad_token_id=151643, max_seq_len=32768)
+        return new_cls
 
 
 def build_rope_cache(max_seq_len, dim, base=1_000_000):
@@ -55,10 +88,10 @@ def apply_rope(q, k, cos_cache, sin_cache):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=RMS_NORM_EPS) -> None:
+    def __init__(self, hidden_size, rms_norm) -> None:
         super().__init__()
-        self.weights = nn.Parameter(torch.ones(dim))
-        self.eps = eps
+        self.weights = nn.Parameter(torch.ones(hidden_size))
+        self.eps = rms_norm
 
     def forward(self, x: torch.Tensor):
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -68,29 +101,31 @@ class RMSNorm(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, n_heads, n_kv_heads, layer_idx) -> None:
+    def __init__(self, config: Qwen3Config, layer_idx) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.head_dim = HEAD_DIM
+        self.n_heads = config.num_attention_heads
+        self.n_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.dim = config.hidden_size
+        self.attn_dropout = config.attention_dropout
 
-        self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+        self.q_proj = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
 
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
         self.register_buffer(
             "cos_cache",
-            build_rope_cache(MAX_SEQ_LEN, self.head_dim)[0],
+            build_rope_cache(config.max_seq_len, self.head_dim)[0],
             persistent=False,
         )
         self.register_buffer(
             "sin_cache",
-            build_rope_cache(MAX_SEQ_LEN, self.head_dim)[1],
+            build_rope_cache(config.max_seq_len, self.head_dim)[1],
             persistent=False,
         )
 
@@ -100,7 +135,7 @@ class Attention(nn.Module):
     def reset_kv_cache(self):
         self.cache_k, self.cache_v = None, None
 
-    def forward(self, x: torch.Tensor, mask=None, use_cache=True):
+    def forward(self, x: torch.Tensor, is_causal=True, use_cache=True):
         batch, seq_len, dim = x.shape
 
         q = self.q_proj(x).reshape(batch, seq_len, self.n_heads, self.head_dim)
@@ -128,42 +163,23 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
 
-        # # there is something wrong with my implementation and i do not know what
-        # # my code did not produced the same output as the HF implementation
-        # attn = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim**0.5)
-
-        # if mask is not None:
-        #     attn = attn + mask
-        # attn = F.softmax(attn, dim=-1)
-        # out = torch.matmul(attn, v)
-        # out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-
-        # if self.layer_idx == 0:
-        #     print("v: ", v[0, 0, :, 0])
-        #     print("k: ", k[0, 0, :, 0])
-        #     print("q: ", q[0, 0, :, 0])
-        # if self.layer_idx == 0:
-        #     print(f"Mask? -> {mask is not None}")
         out = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
-            # attn_mask=mask,
-            dropout_p=0.0,
-            is_causal=(mask is None),  # (mask is not None)
+            dropout_p=self.attn_dropout,
+            is_causal=is_causal,
         )
-        # if self.layer_idx == 0:
-        #     print("out: ", out[0, 0, :, 0])
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(out)
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.activation = nn.SiLU()
 
     def forward(self, x):
@@ -173,37 +189,34 @@ class MLP(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(
         self,
+        config: Qwen3Config,
         layer_idx,
-        dim=HIDDEN_SIZE,
-        n_heads=NUM_ATTENTION_HEADS,
-        n_kv_heads=NUM_KEY_VALUE_HEADS,
-        hidden_dim=INTERMIDIET_SIZE,
     ) -> None:
         super().__init__()
-        self.self_attn = Attention(dim, n_heads, n_kv_heads, layer_idx)
-        self.mlp = MLP(dim, hidden_dim)
-        self.input_layernorm = RMSNorm(dim)
-        self.post_attention_layernorm = RMSNorm(dim)
+        self.self_attn = Attention(config, layer_idx)
+        self.mlp = MLP(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x, mask=None, use_cache=True):
-        x = x + self.self_attn(self.input_layernorm(x), mask, use_cache)
+    def forward(self, x, is_causal=True, use_cache=True):
+        x = x + self.self_attn(self.input_layernorm(x), is_causal, use_cache)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
 class Qwen3(nn.Module):
-    def __init__(self, vocab_size=VOCAB_SIZE, dim=HIDDEN_SIZE, n_layers=NUM_HIDDEN_LAYERS):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
-        self.pad_token_id = PAD_TOKEN_ID
-        self.embeddings = nn.Embedding(vocab_size, dim, self.pad_token_id)
-        self.layers = nn.ModuleList(TransformerBlock(i) for i in range(n_layers))
-        self.norm = RMSNorm(dim)
-        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        self.config = config
+        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.layers = nn.ModuleList(TransformerBlock(config, i) for i in range(config.num_hidden_layers))
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, x, mask=None, use_cache=True):
+    def forward(self, x, is_causal=True, use_cache=True):
         x = self.embeddings(x)
         for layer in self.layers:
-            x = layer(x, mask=mask, use_cache=use_cache)
+            x = layer(x, is_causal=is_causal, use_cache=use_cache)
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits
@@ -253,7 +266,6 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")
 def generate(
     model: Qwen3,
     model_inputs,
-    attention_mask,
     max_new_tokens=100,
     temperature=1.0,
     top_k=50,
@@ -263,10 +275,10 @@ def generate(
 ):
     model.eval()
 
-    print("="*40)
+    print("=" * 40)
     print(model.__class__.__name__)
     print(f"Using KV cache? {use_cache}")
-    print("="*40)
+    print("=" * 40)
 
     start_event = torch.cuda.Event(enable_timing=True)
     first_token_event = torch.cuda.Event(enable_timing=True)
@@ -278,7 +290,7 @@ def generate(
     generated_ids = model_inputs.clone()
     start_event.record()
     # Prompt processing and KV cache fill
-    outputs = model(model_inputs, attention_mask, use_cache)
+    outputs = model(model_inputs, True, use_cache)
     next_token_logits = outputs[:, -1, :]
     if temperature > 0:
         next_token_logits = next_token_logits / temperature
@@ -293,9 +305,9 @@ def generate(
 
     for _ in range(max_new_tokens):
         if use_cache:
-            outputs = model(next_token, 123, use_cache)
+            outputs = model(next_token, False, use_cache)
         else:
-            outputs = model(generated_ids, None, use_cache)
+            outputs = model(generated_ids, True, use_cache)
         next_token_logits = outputs[:, -1, :]
 
         if temperature > 0:
@@ -309,7 +321,7 @@ def generate(
 
         generated_ids = torch.cat([generated_ids, next_token], dim=-1)
 
-        if next_token.item() == 151645:
+        if next_token.item() == model.config.eos_token_id:
             break
     end_event_event.record()
     torch.cuda.synchronize()
@@ -326,6 +338,8 @@ def generate(
         tps = 0.0
 
     print("=" * 40)
-    print(f"    Time to first tokens: {ttft_ms:.4f} ms\n    Tokens per sencond: {tps:.4f}\n    Number of tokens: {num_gen_tokens}")
+    print(
+        f"    Time to first tokens: {ttft_ms:.4f} ms\n    Tokens per sencond: {tps:.4f}\n    Number of tokens: {num_gen_tokens}"
+    )
     print("=" * 40)
     return generated_ids

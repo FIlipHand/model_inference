@@ -1,15 +1,13 @@
-import sys
-
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, Qwen3Model
 
-from models.qwen3 import Qwen3, generate
+from models.qwen3 import Qwen3, Qwen3Config, generate
 
 if __name__ == "__main__":
-    model = Qwen3()
-    model.eval()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_config = Qwen3Config.load("./Qwen3-0.6B")
+    model = Qwen3(model_config)
     model.load_model("./Qwen3-0.6B")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = model.to(device)
 
@@ -22,12 +20,11 @@ if __name__ == "__main__":
     tokenizer_out = tokenizer([text], return_tensors="pt").to(device)
     model_inputs = tokenizer_out["input_ids"]
     attention_mask_float = tokenizer_out["attention_mask"].to(torch.float)
-    
+
     generated_ids = generate(
         model,
         model_inputs,
-        None,
-        max_new_tokens=500,
+        max_new_tokens=10,
         temperature=0.6,
         top_k=20,
         top_p=0.95,
