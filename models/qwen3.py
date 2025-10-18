@@ -1,10 +1,10 @@
 import json
+import os
 import re
 from dataclasses import dataclass, fields
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from safetensors.torch import load_file
 
 
@@ -227,7 +227,9 @@ class Qwen3(nn.Module):
         self.current_pos = 0
 
     def load_model(self, dir_name: str):
-        qwen3_weights = load_file(f"{dir_name}/model.safetensors")
+        safetensor_files = [os.path.join(dir_name, f) for f in os.listdir(dir_name) if f.endswith(".safetensors")]
+        if not safetensor_files:
+            raise FileNotFoundError(f"No .safetensors files found in {dir_name}")
 
         def transform_key(key):
             key = re.sub(r"^model\.", "", key)
@@ -236,110 +238,10 @@ class Qwen3(nn.Module):
                 key = key.replace("weight", "weights")
             return key
 
-        new_state_dict = {transform_key(k): v for k, v in qwen3_weights.items()}
+        new_state_dict = {}
+        for file_path in safetensor_files:
+            weights = load_file(file_path)
+            for k, v in weights.items():
+                new_state_dict[transform_key(k)] = v
+
         self.load_state_dict(new_state_dict)
-
-
-def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")):
-    assert logits.dim() == 2  # batch size, vocab size
-    top_k = min(top_k, logits.size(-1))
-
-    if top_k > 0:
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-        logits[indices_to_remove] = filter_value
-
-    if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-        logits[indices_to_remove] = filter_value
-
-    return logits
-
-
-@torch.no_grad()
-def generate(
-    model: Qwen3,
-    model_inputs,
-    max_new_tokens=100,
-    temperature=1.0,
-    top_k=50,
-    top_p=0.9,
-    do_sample=True,
-    use_cache=True,
-):
-    model.eval()
-
-    print("=" * 40)
-    print(model.__class__.__name__)
-    print(f"Using KV cache? {use_cache}")
-    print("=" * 40)
-
-    start_event = torch.cuda.Event(enable_timing=True)
-    first_token_event = torch.cuda.Event(enable_timing=True)
-    end_event_event = torch.cuda.Event(enable_timing=True)
-
-    if use_cache:
-        model.reset_kv_cache()
-
-    generated_ids = model_inputs.clone()
-    start_event.record()
-    # Prompt processing and KV cache fill
-    outputs = model(model_inputs, True, use_cache)
-    next_token_logits = outputs[:, -1, :]
-    if temperature > 0:
-        next_token_logits = next_token_logits / temperature
-    filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
-    if do_sample:
-        next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
-    else:
-        next_token = torch.argmax(filtered_logits, dim=-1, keepdim=True)
-    generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-
-    first_token_event.record()
-
-    for _ in range(max_new_tokens):
-        if use_cache:
-            outputs = model(next_token, False, use_cache)
-        else:
-            outputs = model(generated_ids, True, use_cache)
-        next_token_logits = outputs[:, -1, :]
-
-        if temperature > 0:
-            next_token_logits = next_token_logits / temperature
-
-        filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
-        if do_sample:
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
-        else:
-            next_token = torch.argmax(filtered_logits, dim=-1, keepdim=True)
-
-        generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-
-        if next_token.item() == model.config.eos_token_id:
-            break
-    end_event_event.record()
-    torch.cuda.synchronize()
-
-    ttft_ms = start_event.elapsed_time(first_token_event)
-    total_time_ms = start_event.elapsed_time(end_event_event)
-    num_gen_tokens = len(generated_ids[0] - model_inputs.shape[1])
-
-    if num_gen_tokens > 1 and total_time_ms > ttft_ms:
-        generation_time_s = (total_time_ms - ttft_ms) / 1000.0
-        num_subsequent_tokens = num_gen_tokens - 1
-        tps = num_subsequent_tokens / generation_time_s
-    else:
-        tps = 0.0
-
-    print("=" * 40)
-    print(
-        f"    Time to first tokens: {ttft_ms:.4f} ms\n    Tokens per sencond: {tps:.4f}\n    Number of tokens: {num_gen_tokens}"
-    )
-    print("=" * 40)
-    return generated_ids
