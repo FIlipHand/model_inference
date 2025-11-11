@@ -2,10 +2,13 @@ import json
 import os
 import re
 from dataclasses import dataclass, fields
+from typing import List
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
+
+from model_utils import KVCache, ModelOutput
 
 
 @dataclass
@@ -151,7 +154,7 @@ class Attention(nn.Module):
             else:
                 self.cache_k = torch.cat([self.cache_k, k], dim=1)
                 self.cache_v = torch.cat([self.cache_v, v], dim=1)  # type: ignore
-                k, v = self.cache_k, self.cache_v
+            k, v = self.cache_k, self.cache_v
 
         q, k = apply_rope(q, k, self.cos_cache, self.sin_cache)
 
@@ -171,7 +174,7 @@ class Attention(nn.Module):
             is_causal=is_causal,
         )
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-        return self.o_proj(out)
+        return KVCache(k, v), self.o_proj(out)
 
 
 class MLP(nn.Module):
@@ -199,9 +202,10 @@ class TransformerBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(self, x, is_causal=True, use_cache=True):
-        x = x + self.self_attn(self.input_layernorm(x), is_causal, use_cache)
+        past_kv, self_attn = self.self_attn(self.input_layernorm(x), is_causal, use_cache)
+        x = x + self_attn
         x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        return past_kv, x
 
 
 class Qwen3(nn.Module):
@@ -213,17 +217,32 @@ class Qwen3(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, x, is_causal=True, use_cache=True):
+    def forward(self, x, is_causal=True, use_cache=True) -> ModelOutput:
         x = self.embeddings(x)
+        past_kv_list = []
         for layer in self.layers:
-            x = layer(x, is_causal=is_causal, use_cache=use_cache)
+            past_kv, x = layer(x, is_causal=is_causal, use_cache=use_cache)
+            past_kv_list.append(past_kv)
         x = self.norm(x)
         logits = self.lm_head(x)
-        return logits
+        return ModelOutput(logits, past_kv_list)
+
+    def update_kv_cache(self, new_cache: List[KVCache]):
+        for idx, layer in enumerate(self.layers):
+            assert isinstance(layer.self_attn, Attention)
+            layer.self_attn.cache_k = new_cache[idx].keys
+            layer.self_attn.cache_v = new_cache[idx].values
+
+    def get_kv_cache(self) -> List[KVCache]:
+        kv_cache_list = []
+        for layer in self.layers:
+            kv_cache_list.append(KVCache(layer.self_attn.cache_k, layer.self_attn.cache_v))  # type: ignore
+        return kv_cache_list
 
     def reset_kv_cache(self):
         for layer in self.layers:
-            layer.self_attn.reset_kv_cache()  # type: ignore
+            assert isinstance(layer.self_attn, Attention)
+            layer.self_attn.reset_kv_cache()
         self.current_pos = 0
 
     def load_model(self, dir_name: str):
