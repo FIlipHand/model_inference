@@ -65,13 +65,15 @@ def apply_rope(q, k, cos_cache, sin_cache):
     kv_len = k.shape[1]
     q_len = q.shape[1]
 
-    cos_k = cos_cache[:kv_len]
-    sin_k = sin_cache[:kv_len]
+    # Convert cos/sin caches to match the dtype of q and k
+    dtype = q.dtype
+    cos_k = cos_cache[:kv_len].to(dtype)
+    sin_k = sin_cache[:kv_len].to(dtype)
 
     # With KV cache kv_len - q_len = kv_len - 1 which is correct index for q
     # Without KV cache (or prefill) it is equal to 0 which is also correct
-    cos_q = cos_cache[kv_len - q_len : kv_len]
-    sin_q = sin_cache[kv_len - q_len : kv_len]
+    cos_q = cos_cache[kv_len - q_len : kv_len].to(dtype)
+    sin_q = sin_cache[kv_len - q_len : kv_len].to(dtype)
 
     def rotate_half(x):
         x1 = x[..., : x.shape[-1] // 2]
@@ -84,8 +86,8 @@ def apply_rope(q, k, cos_cache, sin_cache):
     cos_k_full = torch.cat((cos_k, cos_k), dim=-1).unsqueeze(0).unsqueeze(2)  # [1, kv_len, 1, head_dim]
     sin_k_full = torch.cat((sin_k, sin_k), dim=-1).unsqueeze(0).unsqueeze(2)
 
-    q_rot = q * cos_q_full + rotate_half(q) * sin_q_full
-    k_rot = k * cos_k_full + rotate_half(k) * sin_k_full
+    q_rot = (q * cos_q_full + rotate_half(q) * sin_q_full).to(dtype)
+    k_rot = (k * cos_k_full + rotate_half(k) * sin_k_full).to(dtype)
 
     return q_rot, k_rot
 
@@ -166,6 +168,12 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
 
+        # Ensure q, k, v have the same dtype before attention (match input dtype)
+        target_dtype = x.dtype
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+
         out = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -218,7 +226,7 @@ class Qwen3(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, x, is_causal=True, use_cache=True) -> ModelOutput:
-        x = self.embeddings(x)
+        x = self.embeddings(x).contiguous()
         past_kv_list = []
         for layer in self.layers:
             past_kv, x = layer(x, is_causal=is_causal, use_cache=use_cache)
